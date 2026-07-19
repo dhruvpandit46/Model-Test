@@ -1,4 +1,4 @@
-// script.js – complete wake word pipeline with ONNX runtime, no UI debug
+// script.js – complete wake word pipeline with ONNX runtime
 import * as ort from 'onnxruntime-web';
 
 // ----- configuration -------------------------------------------------
@@ -16,7 +16,7 @@ const WAKE_THRESHOLD = 0.5;
 // model files (same folder as HTML)
 const MEL_MODEL_PATH = './melspectrogram.onnx';
 const EMBED_MODEL_PATH = './embedding_model.onnx';
-const MULTI_MODEL_PATH = './hey_Aniquen.onnx';   // <-- matches your actual filename
+const MULTI_MODEL_PATH = './hey_Aniquen.onnx';
 
 // ----- DOM refs ------------------------------------------------------
 const statusEl = document.getElementById('status');
@@ -26,6 +26,7 @@ const bodyEl = document.body;
 let audioContext = null;
 let audioBuffer = [];
 let isWakeActive = false;
+let isProcessing = false;   // guards against overlapping inference cycles
 
 // ONNX sessions
 let melSession = null;
@@ -119,54 +120,70 @@ async function computeWakeProbability(embeddingStack) {
 let embeddingHistory = [];
 
 async function processAudioChunk(newSamples) {
-    audioBuffer.push(...newSamples);
-    if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
-        audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
-    }
-    if (audioBuffer.length < MIN_BUFFER_SAMPLES) return;
+    // skip this cycle entirely if the previous one hasn't finished yet —
+    // this is what was causing the lag / slow right-click menu
+    if (isProcessing) return;
+    isProcessing = true;
 
-    const chunkSize = Math.min(audioBuffer.length, 48000);
-    const startIdx = audioBuffer.length - chunkSize;
-    const chunk = new Float32Array(audioBuffer.slice(startIdx));
-
-    let melFrames;
     try {
-        melFrames = await computeMelSpectrogram(chunk);
-    } catch (e) {
-        console.warn('[ANIQUEN] mel error:', e);
-        return;
-    }
-    if (!melFrames || melFrames.length < FRAMES_PER_WINDOW) return;
+        audioBuffer.push(...newSamples);
+        if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
+            audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
+        }
+        if (audioBuffer.length < MIN_BUFFER_SAMPLES) return;
 
-    let embeddings;
-    try {
-        embeddings = await computeEmbeddings(melFrames);
-    } catch (e) {
-        console.warn('[ANIQUEN] embed error:', e);
-        return;
-    }
-    if (!embeddings || embeddings.length === 0) return;
+        // debug: quick RMS level of this chunk, so we can see if the mic
+        // signal is actually strong enough — remove once confirmed working
+        let sumSq = 0;
+        for (let i = 0; i < newSamples.length; i++) sumSq += newSamples[i] * newSamples[i];
+        const rms = Math.sqrt(sumSq / newSamples.length);
+        console.log('[ANIQUEN] mic RMS level:', rms.toFixed(1));
 
-    embeddingHistory.push(...embeddings);
-    if (embeddingHistory.length > CONTEXT_EMBEDDINGS) {
-        embeddingHistory = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
-    }
-    if (embeddingHistory.length < CONTEXT_EMBEDDINGS) return;
+        const chunkSize = Math.min(audioBuffer.length, 48000);
+        const startIdx = audioBuffer.length - chunkSize;
+        const chunk = new Float32Array(audioBuffer.slice(startIdx));
 
-    const context = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
+        let melFrames;
+        try {
+            melFrames = await computeMelSpectrogram(chunk);
+        } catch (e) {
+            console.warn('[ANIQUEN] mel error:', e);
+            return;
+        }
+        if (!melFrames || melFrames.length < FRAMES_PER_WINDOW) return;
 
-    let prob;
-    try {
-        prob = await computeWakeProbability(context);
-    } catch (e) {
-        console.warn('[ANIQUEN] multi error:', e);
-        return;
-    }
+        let embeddings;
+        try {
+            embeddings = await computeEmbeddings(melFrames);
+        } catch (e) {
+            console.warn('[ANIQUEN] embed error:', e);
+            return;
+        }
+        if (!embeddings || embeddings.length === 0) return;
 
-    console.log('[ANIQUEN] wake prob:', prob.toFixed(3)); // remove once confirmed working
+        embeddingHistory.push(...embeddings);
+        if (embeddingHistory.length > CONTEXT_EMBEDDINGS) {
+            embeddingHistory = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
+        }
+        if (embeddingHistory.length < CONTEXT_EMBEDDINGS) return;
 
-    if (prob >= WAKE_THRESHOLD) {
-        triggerWake();
+        const context = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
+
+        let prob;
+        try {
+            prob = await computeWakeProbability(context);
+        } catch (e) {
+            console.warn('[ANIQUEN] multi error:', e);
+            return;
+        }
+
+        console.log('[ANIQUEN] wake prob:', prob.toFixed(3)); // remove once confirmed working
+
+        if (prob >= WAKE_THRESHOLD) {
+            triggerWake();
+        }
+    } finally {
+        isProcessing = false;
     }
 }
 
@@ -224,7 +241,7 @@ async function init() {
                 sampleRate: SAMPLE_RATE,
                 echoCancellation: false,
                 noiseSuppression: false,
-                autoGainControl: false,
+                autoGainControl: true,   // re-enabled — boosts quiet mic signal
             }
         });
         setupAudioProcessing(stream);
