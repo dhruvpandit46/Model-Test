@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Offline pipeline test</title>
+<style>
+  body { font-family: sans-serif; margin: 2rem; }
+  pre { background: #111; color: #0f0; padding: 1rem; overflow-x: auto; font-size: 0.85rem; }
+  .peak { color: #ff0; font-weight: bold; }
+</style>
+</head>
+<body>
+<h2>Offline pipeline test (uses recording.wav, not the mic)</h2>
+<p>Put <code>recording.wav</code> (the same file you uploaded to chat) in this same folder, then reload this page. Results print below.</p>
+<pre id="log">Loading...</pre>
+
+<script type="importmap">
+{
+  "imports": {
+    "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.bundle.min.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import * as ort from 'onnxruntime-web';
+
+const logEl = document.getElementById('log');
+function log(msg) { logEl.textContent += msg + '\n'; }
+
+const FRAMES_PER_WINDOW = 76;
+const MEL_BINS = 32;
+const STRIDE = 8;
+const CONTEXT_EMBEDDINGS = 16;
+const WAKE_THRESHOLD = 0.5;
+
+async function computeMelSpectrogram(melSession, samples) {
+    const inputTensor = new ort.Tensor('float32', samples, [1, samples.length]);
+    const results = await melSession.run({ input: inputTensor });
+    const melData = results.output.data;
+    const total = melData.length;
+    const frames = total / MEL_BINS;
+    const normalized = new Float32Array(total);
+    for (let i = 0; i < total; i++) normalized[i] = melData[i] / 10 + 2;
+    const mel2d = [];
+    for (let f = 0; f < frames; f++) {
+        const start = f * MEL_BINS;
+        mel2d.push(normalized.slice(start, start + MEL_BINS));
+    }
+    return mel2d;
+}
+
+async function computeEmbeddings(embedSession, melFrames) {
+    const embeddings = [];
+    const totalFrames = melFrames.length;
+    if (totalFrames < FRAMES_PER_WINDOW) return embeddings;
+    for (let start = 0; start <= totalFrames - FRAMES_PER_WINDOW; start += STRIDE) {
+        const windowData = new Float32Array(FRAMES_PER_WINDOW * MEL_BINS);
+        for (let i = 0; i < FRAMES_PER_WINDOW; i++) {
+            const src = melFrames[start + i];
+            for (let m = 0; m < MEL_BINS; m++) windowData[i * MEL_BINS + m] = src[m];
+        }
+        const inputTensor = new ort.Tensor('float32', windowData, [1, FRAMES_PER_WINDOW, MEL_BINS, 1]);
+        const result = await embedSession.run({ input_1: inputTensor });
+        embeddings.push(new Float32Array(result.conv2d_19.data));
+    }
+    return embeddings;
+}
+
+async function computeWakeProbability(multiSession, embeddingStack) {
+    const flat = new Float32Array(16 * 96);
+    for (let i = 0; i < 16; i++) {
+        const emb = embeddingStack[i];
+        for (let j = 0; j < 96; j++) flat[i * 96 + j] = emb[j];
+    }
+    const inputTensor = new ort.Tensor('float32', flat, [1, 16, 96]);
+    const result = await multiSession.run({ 'onnx::Flatten_0': inputTensor });
+    const score = result['39'].data[0];
+    return (score >= 0 && score <= 1) ? score : 1 / (1 + Math.exp(-score));
+}
+
+async function main() {
+    log('Loading models...');
+    const opts = { executionProviders: ['wasm'] };
+    const melSession = await ort.InferenceSession.create('./melspectrogram.onnx', opts);
+    const embedSession = await ort.InferenceSession.create('./embedding_model.onnx', opts);
+    const multiSession = await ort.InferenceSession.create('./hey_Aniquen.onnx', opts);
+    log('Models loaded. Fetching recording.wav...');
+
+    const resp = await fetch('./recording.wav');
+    if (!resp.ok) { log('ERROR: could not fetch recording.wav — make sure it is in this folder.'); return; }
+    const arrayBuffer = await resp.arrayBuffer();
+
+    // decode WAV header manually to get raw PCM at its native rate (should be 16000)
+    const dv = new DataView(arrayBuffer);
+    const sampleRate = dv.getUint32(24, true);
+    const bitsPerSample = dv.getUint16(34, true);
+    log(`WAV sample rate: ${sampleRate}, bits: ${bitsPerSample}`);
+
+    // find 'data' chunk
+    let offset = 12;
+    let dataOffset = -1, dataSize = 0;
+    while (offset < dv.byteLength - 8) {
+        const chunkId = String.fromCharCode(dv.getUint8(offset), dv.getUint8(offset+1), dv.getUint8(offset+2), dv.getUint8(offset+3));
+        const chunkSize = dv.getUint32(offset + 4, true);
+        if (chunkId === 'data') { dataOffset = offset + 8; dataSize = chunkSize; break; }
+        offset += 8 + chunkSize + (chunkSize % 2);
+    }
+    if (dataOffset === -1) { log('ERROR: no data chunk found in WAV'); return; }
+
+    const numSamples = dataSize / 2; // 16-bit
+    const pcm = new Int16Array(arrayBuffer, dataOffset, numSamples);
+    const fullSamples = new Float32Array(numSamples);
+    for (let i = 0; i < numSamples; i++) fullSamples[i] = pcm[i]; // already int16-scale, matches our *32768 convention
+
+    log(`Loaded ${numSamples} samples (${(numSamples/16000).toFixed(2)}s). Running full-clip mel + sliding embeddings...`);
+
+    const melFrames = await computeMelSpectrogram(melSession, fullSamples.subarray(0).buffer ? fullSamples : fullSamples);
+    // note: computeMelSpectrogram expects a Float32Array directly
+    const mel = await computeMelSpectrogram(melSession, fullSamples);
+    log(`Mel frames: ${mel.length}`);
+
+    const embeddings = await computeEmbeddings(embedSession, mel);
+    log(`Embeddings: ${embeddings.length}`);
+
+    log('');
+    log('time(s)   prob');
+    let maxProb = 0;
+    for (let i = 15; i < embeddings.length; i++) {
+        const context = embeddings.slice(i - 15, i + 1);
+        const prob = await computeWakeProbability(multiSession, context);
+        const t = (i * 8 * 0.01).toFixed(2);
+        const isPeak = prob >= WAKE_THRESHOLD;
+        if (prob > maxProb) maxProb = prob;
+        log(`${t}s    ${prob.toFixed(5)}${isPeak ? '   <-- OVER THRESHOLD' : ''}`);
+    }
+    log('');
+    log(`MAX PROB: ${maxProb.toFixed(5)}`);
+    log(maxProb >= WAKE_THRESHOLD ? 'RESULT: Browser pipeline DETECTS the wake word correctly.' : 'RESULT: Browser pipeline FAILED to detect it — there is a real JS bug.');
+}
+
+main().catch(e => log('FATAL ERROR: ' + e.message + '\n' + e.stack));
+</script>
+</body>
+</html>
