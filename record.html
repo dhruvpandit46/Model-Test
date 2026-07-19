@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Record test clip</title>
+<style>
+  body { font-family: sans-serif; text-align: center; margin-top: 4rem; }
+  button { font-size: 1.2rem; padding: 0.8rem 1.6rem; margin: 0.5rem; }
+  #status { font-size: 1.1rem; margin-top: 1rem; }
+</style>
+</head>
+<body>
+  <h2>Wake word test recorder</h2>
+  <p>Records 6 seconds of mic audio at 16kHz mono, then gives you a WAV file to download.</p>
+  <button id="startBtn">Start recording (6s)</button>
+  <p id="status"></p>
+  <a id="downloadLink" style="display:none;">Download recording.wav</a>
+
+<script>
+const SAMPLE_RATE = 16000;
+const DURATION_SEC = 6;
+
+document.getElementById('startBtn').onclick = async () => {
+  const status = document.getElementById('status');
+  status.textContent = 'Requesting mic...';
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      sampleRate: SAMPLE_RATE,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: true,
+    }
+  });
+
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+  const chunks = [];
+  let samplesCollected = 0;
+  const targetSamples = SAMPLE_RATE * DURATION_SEC;
+
+  status.textContent = 'Recording... speak now!';
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(input));
+    samplesCollected += input.length;
+    if (samplesCollected >= targetSamples) {
+      processor.disconnect();
+      source.disconnect();
+      stream.getTracks().forEach(t => t.stop());
+      finish();
+    }
+  };
+
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
+  function finish() {
+    status.textContent = 'Done recording. Building WAV file...';
+    // flatten
+    let total = 0;
+    chunks.forEach(c => total += c.length);
+    const flat = new Float32Array(total);
+    let offset = 0;
+    chunks.forEach(c => { flat.set(c, offset); offset += c.length; });
+
+    // convert float32 [-1,1] to int16 PCM
+    const pcm = new Int16Array(flat.length);
+    for (let i = 0; i < flat.length; i++) {
+      let s = Math.max(-1, Math.min(1, flat[i]));
+      pcm[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+
+    const wavBuffer = encodeWAV(pcm, SAMPLE_RATE);
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const link = document.getElementById('downloadLink');
+    link.href = url;
+    link.download = 'recording.wav';
+    link.style.display = 'inline-block';
+    link.textContent = 'Download recording.wav';
+    status.textContent = 'Ready — click below to download, then upload it in chat.';
+  }
+
+  function encodeWAV(pcmData, sampleRate) {
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = pcmData.length * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    function writeString(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let offset = 44;
+    for (let i = 0; i < pcmData.length; i++, offset += 2) {
+      view.setInt16(offset, pcmData[i], true);
+    }
+    return buffer;
+  }
+};
+</script>
+</body>
+</html>
