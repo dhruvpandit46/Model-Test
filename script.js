@@ -10,8 +10,8 @@ const CONTEXT_EMBEDDINGS = 16;   // stack 16 embeddings
 
 // analysis window: smaller = faster per cycle = keeps up with mic in real time.
 // 24000 samples = 1.5s, still comfortably longer than a spoken wake word.
-const MAX_BUFFER_SAMPLES = 24000;
-const MIN_BUFFER_SAMPLES = 16000;
+const MAX_BUFFER_SAMPLES = 48000;  // change from 24000 back to 48000 (3s window)
+const MIN_BUFFER_SAMPLES = 32000;  // change from 16000 back to 32000
 
 // internal threshold (0.5, but user never sees it)
 const WAKE_THRESHOLD = 0.5;
