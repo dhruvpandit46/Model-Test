@@ -7,8 +7,11 @@ const FRAMES_PER_WINDOW = 76;
 const MEL_BINS = 32;
 const STRIDE = 8;                // frames
 const CONTEXT_EMBEDDINGS = 16;   // stack 16 embeddings
-const MAX_BUFFER_SAMPLES = 48000;
-const MIN_BUFFER_SAMPLES = 32000;
+
+// analysis window: smaller = faster per cycle = keeps up with mic in real time.
+// 24000 samples = 1.5s, still comfortably longer than a spoken wake word.
+const MAX_BUFFER_SAMPLES = 24000;
+const MIN_BUFFER_SAMPLES = 16000;
 
 // internal threshold (0.5, but user never sees it)
 const WAKE_THRESHOLD = 0.5;
@@ -24,9 +27,9 @@ const bodyEl = document.body;
 
 // ----- state ---------------------------------------------------------
 let audioContext = null;
-let audioBuffer = [];
+let audioBuffer = [];         // continuously updated — NEVER dropped, even while busy
 let isWakeActive = false;
-let isProcessing = false;   // guards against overlapping inference cycles
+let isProcessing = false;     // guards only the heavy inference, not audio capture
 
 // ONNX sessions
 let melSession = null;
@@ -119,29 +122,24 @@ async function computeWakeProbability(embeddingStack) {
 // ----- main detection loop --------------------------------------------
 let embeddingHistory = [];
 
-async function processAudioChunk(newSamples) {
-    // skip this cycle entirely if the previous one hasn't finished yet —
-    // this is what was causing the lag / slow right-click menu
+// NOTE: this no longer takes newSamples or touches audioBuffer directly —
+// audio capture happens unconditionally in setupAudioProcessing(), so no
+// audio is ever lost even if this function is still busy from last cycle.
+async function processAudioChunk() {
     if (isProcessing) return;
     isProcessing = true;
 
     try {
-        audioBuffer.push(...newSamples);
-        if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
-            audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
-        }
         if (audioBuffer.length < MIN_BUFFER_SAMPLES) return;
 
-        // debug: quick RMS level of this chunk, so we can see if the mic
-        // signal is actually strong enough — remove once confirmed working
-        let sumSq = 0;
-        for (let i = 0; i < newSamples.length; i++) sumSq += newSamples[i] * newSamples[i];
-        const rms = Math.sqrt(sumSq / newSamples.length);
-        console.log('[ANIQUEN] mic RMS level:', rms.toFixed(1));
-
-        const chunkSize = Math.min(audioBuffer.length, 48000);
+        const chunkSize = Math.min(audioBuffer.length, MAX_BUFFER_SAMPLES);
         const startIdx = audioBuffer.length - chunkSize;
         const chunk = new Float32Array(audioBuffer.slice(startIdx));
+
+        // debug: quick RMS level of this chunk — remove once confirmed working
+        let sumSq = 0;
+        for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
+        const rms = Math.sqrt(sumSq / chunk.length);
 
         let melFrames;
         try {
@@ -177,7 +175,7 @@ async function processAudioChunk(newSamples) {
             return;
         }
 
-        console.log('[ANIQUEN] wake prob:', prob.toFixed(3)); // remove once confirmed working
+        console.log('[ANIQUEN] rms:', rms.toFixed(1), ' wake prob:', prob.toFixed(3)); // remove once confirmed working
 
         if (prob >= WAKE_THRESHOLD) {
             triggerWake();
@@ -222,8 +220,16 @@ function setupAudioProcessing(stream) {
         for (let i = 0; i < inputData.length; i++) {
             scaled[i] = inputData[i] * 32768;
         }
+
+        // ALWAYS buffer incoming audio, regardless of whether a heavy
+        // inference cycle is currently running — this is the fix.
+        audioBuffer.push(...scaled);
+        if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
+            audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
+        }
+
         if (!isWakeActive) {
-            processAudioChunk(scaled).catch(e => console.warn(e));
+            processAudioChunk().catch(e => console.warn(e));
         }
     };
 
@@ -241,7 +247,7 @@ async function init() {
                 sampleRate: SAMPLE_RATE,
                 echoCancellation: false,
                 noiseSuppression: false,
-                autoGainControl: true,   // re-enabled — boosts quiet mic signal
+                autoGainControl: true,
             }
         });
         setupAudioProcessing(stream);
