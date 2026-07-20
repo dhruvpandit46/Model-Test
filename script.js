@@ -1,6 +1,12 @@
 // script.js – complete wake word pipeline with ONNX runtime
 import * as ort from 'onnxruntime-web';
 
+// Use multiple CPU threads for WASM inference — only actually takes effect
+// if the page is cross-origin isolated (see coi-serviceworker.js in index.html).
+// Falls back to 1 thread silently if isolation isn't active.
+ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+ort.env.wasm.simd = true;
+
 // ----- configuration -------------------------------------------------
 const SAMPLE_RATE = 16000;
 const FRAMES_PER_WINDOW = 76;
