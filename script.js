@@ -8,13 +8,19 @@ const MEL_BINS = 32;
 const STRIDE = 8;                // frames
 const CONTEXT_EMBEDDINGS = 16;   // stack 16 embeddings
 
-// analysis window: smaller = faster per cycle = keeps up with mic in real time.
-// 24000 samples = 1.5s, still comfortably longer than a spoken wake word.
-const MAX_BUFFER_SAMPLES = 48000;  // change from 24000 back to 48000 (3s window)
-const MIN_BUFFER_SAMPLES = 32000;  // change from 16000 back to 32000
+// analysis window: 3s buffer gives slow WASM cycles enough margin to still
+// catch a spoken word before it ages out.
+const MAX_BUFFER_SAMPLES = 48000;
+const MIN_BUFFER_SAMPLES = 32000;
 
-// internal threshold (0.5, but user never sees it)
-const WAKE_THRESHOLD = 0.5;
+// lowered from 0.5 — model's recall is imperfect (~37%), so we accept a
+// slightly higher false-positive risk in exchange for actually catching
+// real wake-word utterances more often.
+const WAKE_THRESHOLD = 0.3;
+
+// how many of the most recent per-cycle "max prob" readings we keep for
+// the rolling-max safety net (helps smooth over a single unlucky cycle)
+const CYCLE_HISTORY_LEN = 4;
 
 // model files (same folder as HTML)
 const MEL_MODEL_PATH = './melspectrogram.onnx';
@@ -120,11 +126,11 @@ async function computeWakeProbability(embeddingStack) {
 }
 
 // ----- main detection loop --------------------------------------------
-let embeddingHistory = [];
+let embeddingHistory = [];   // rolling buffer of recent embeddings (kept > 16 so we can slide)
+let cycleMaxHistory = [];    // rolling buffer of recent per-cycle max probabilities
 
-// NOTE: this no longer takes newSamples or touches audioBuffer directly —
-// audio capture happens unconditionally in setupAudioProcessing(), so no
-// audio is ever lost even if this function is still busy from last cycle.
+const EMBEDDING_HISTORY_MAX = 40; // keep enough history to slide the 16-window across several positions
+
 async function processAudioChunk() {
     if (isProcessing) return;
     isProcessing = true;
@@ -150,34 +156,62 @@ async function processAudioChunk() {
         }
         if (!melFrames || melFrames.length < FRAMES_PER_WINDOW) return;
 
-        let embeddings;
+        let newEmbeddings;
         try {
-            embeddings = await computeEmbeddings(melFrames);
+            newEmbeddings = await computeEmbeddings(melFrames);
         } catch (e) {
             console.warn('[ANIQUEN] embed error:', e);
             return;
         }
-        if (!embeddings || embeddings.length === 0) return;
+        if (!newEmbeddings || newEmbeddings.length === 0) return;
 
-        embeddingHistory.push(...embeddings);
-        if (embeddingHistory.length > CONTEXT_EMBEDDINGS) {
-            embeddingHistory = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
+        // append to a longer rolling history so we can slide the 16-window
+        // across multiple positions instead of only checking the very last one
+        embeddingHistory.push(...newEmbeddings);
+        if (embeddingHistory.length > EMBEDDING_HISTORY_MAX) {
+            embeddingHistory = embeddingHistory.slice(-EMBEDDING_HISTORY_MAX);
         }
         if (embeddingHistory.length < CONTEXT_EMBEDDINGS) return;
 
-        const context = embeddingHistory.slice(-CONTEXT_EMBEDDINGS);
-
-        let prob;
-        try {
-            prob = await computeWakeProbability(context);
-        } catch (e) {
-            console.warn('[ANIQUEN] multi error:', e);
-            return;
+        // ROLLING MAX: evaluate wake probability at every valid 16-window
+        // position within the current history, not just the last one.
+        // This catches the wake word even if it landed slightly off-center
+        // relative to where the very latest window happens to sit.
+        let cycleMaxProb = 0;
+        let triggered = false;
+        const lastPossibleStart = embeddingHistory.length - CONTEXT_EMBEDDINGS;
+        // only check the newest few positions each cycle to keep cost reasonable
+        const checkFrom = Math.max(0, lastPossibleStart - (newEmbeddings.length));
+        for (let start = checkFrom; start <= lastPossibleStart; start++) {
+            const context = embeddingHistory.slice(start, start + CONTEXT_EMBEDDINGS);
+            let prob;
+            try {
+                prob = await computeWakeProbability(context);
+            } catch (e) {
+                console.warn('[ANIQUEN] multi error:', e);
+                continue;
+            }
+            if (prob > cycleMaxProb) cycleMaxProb = prob;
+            if (prob >= WAKE_THRESHOLD) {
+                triggered = true;
+                break; // no need to keep checking once we've already crossed threshold
+            }
         }
 
-        console.log('[ANIQUEN] rms:', rms.toFixed(1), ' wake prob:', prob.toFixed(3)); // remove once confirmed working
+        // rolling max across recent cycles too, as a smoothing safety net
+        cycleMaxHistory.push(cycleMaxProb);
+        if (cycleMaxHistory.length > CYCLE_HISTORY_LEN) {
+            cycleMaxHistory = cycleMaxHistory.slice(-CYCLE_HISTORY_LEN);
+        }
+        const recentRollingMax = Math.max(...cycleMaxHistory);
 
-        if (prob >= WAKE_THRESHOLD) {
+        console.log(
+            '[ANIQUEN] rms:', rms.toFixed(1),
+            ' cycle max prob:', cycleMaxProb.toFixed(3),
+            ' rolling max (last', CYCLE_HISTORY_LEN, 'cycles):', recentRollingMax.toFixed(3)
+        ); // remove once confirmed working
+
+        if (triggered || recentRollingMax >= WAKE_THRESHOLD) {
             triggerWake();
         }
     } finally {
@@ -203,6 +237,7 @@ function triggerWake() {
         statusEl.textContent = 'Listening…';
         isWakeActive = false;
         wakeTimeout = null;
+        cycleMaxHistory = []; // reset so old high readings don't cause an instant re-trigger
     }, 2000);
 }
 
@@ -222,7 +257,7 @@ function setupAudioProcessing(stream) {
         }
 
         // ALWAYS buffer incoming audio, regardless of whether a heavy
-        // inference cycle is currently running — this is the fix.
+        // inference cycle is currently running.
         audioBuffer.push(...scaled);
         if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
             audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
