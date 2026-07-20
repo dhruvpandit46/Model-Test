@@ -2,24 +2,16 @@
 import * as ort from 'onnxruntime-web';
 
 // ----- configuration -------------------------------------------------
-const SAMPLE_RATE = 16000;
+const SAMPLE_RATE = 16000;       // the rate our MODELS expect
 const FRAMES_PER_WINDOW = 76;
 const MEL_BINS = 32;
 const STRIDE = 8;                // frames
 const CONTEXT_EMBEDDINGS = 16;   // stack 16 embeddings
 
-// analysis window: 3s buffer gives slow WASM cycles enough margin to still
-// catch a spoken word before it ages out.
 const MAX_BUFFER_SAMPLES = 48000;
 const MIN_BUFFER_SAMPLES = 32000;
 
-// lowered from 0.5 — model's recall is imperfect (~37%), so we accept a
-// slightly higher false-positive risk in exchange for actually catching
-// real wake-word utterances more often.
 const WAKE_THRESHOLD = 0.3;
-
-// how many of the most recent per-cycle "max prob" readings we keep for
-// the rolling-max safety net (helps smooth over a single unlucky cycle)
 const CYCLE_HISTORY_LEN = 4;
 
 // model files (same folder as HTML)
@@ -33,9 +25,10 @@ const bodyEl = document.body;
 
 // ----- state ---------------------------------------------------------
 let audioContext = null;
-let audioBuffer = [];         // continuously updated — NEVER dropped, even while busy
+let audioBuffer = [];
 let isWakeActive = false;
-let isProcessing = false;     // guards only the heavy inference, not audio capture
+let isProcessing = false;
+let deviceSampleRate = SAMPLE_RATE;  // will be updated to the ACTUAL rate the browser gives us
 
 // ONNX sessions
 let melSession = null;
@@ -44,6 +37,27 @@ let multiSession = null;
 
 function sigmoid(x) {
     return 1 / (1 + Math.exp(-x));
+}
+
+// ----- resampling (critical for mobile) -------------------------------
+// Many mobile browsers silently ignore the requested AudioContext
+// sampleRate and give you audio at the device's native hardware rate
+// instead (commonly 44100 or 48000). Our models require exactly 16000Hz.
+// This linearly resamples whatever we actually get down/up to 16000Hz,
+// so the pipeline works correctly regardless of device/browser quirks.
+function resampleTo16k(input, inputRate) {
+    if (inputRate === SAMPLE_RATE) return input;
+    const ratio = inputRate / SAMPLE_RATE;
+    const newLength = Math.round(input.length / ratio);
+    const result = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+        const srcIndex = i * ratio;
+        const idx0 = Math.floor(srcIndex);
+        const idx1 = Math.min(idx0 + 1, input.length - 1);
+        const frac = srcIndex - idx0;
+        result[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+    }
+    return result;
 }
 
 // ----- load ONNX models ----------------------------------------------
@@ -63,11 +77,8 @@ async function loadModels() {
 
 // ----- audio processing: mel spectrogram -----------------------------
 async function computeMelSpectrogram(samples) {
-    // input name is "input", shape (1, samples)
     const inputTensor = new ort.Tensor('float32', samples, [1, samples.length]);
     const results = await melSession.run({ input: inputTensor });
-    // output name is "output", shape (1, 1, frames, 32) — contiguous, so
-    // flattening and slicing every 32 values still gives [frame][mel] rows
     const melData = results.output.data;
     const total = melData.length;
     const frames = total / MEL_BINS;
@@ -97,10 +108,8 @@ async function computeEmbeddings(melFrames) {
                 windowData[i * MEL_BINS + m] = src[m];
             }
         }
-        // input name is "input_1", shape (1, 76, 32, 1)
         const inputTensor = new ort.Tensor('float32', windowData, [1, FRAMES_PER_WINDOW, MEL_BINS, 1]);
         const result = await embedSession.run({ input_1: inputTensor });
-        // output name is "conv2d_19", shape (1,1,1,96)
         const out = result.conv2d_19.data;
         embeddings.push(new Float32Array(out));
     }
@@ -116,20 +125,17 @@ async function computeWakeProbability(embeddingStack) {
             flat[i * 96 + j] = emb[j];
         }
     }
-    // input name is "onnx::Flatten_0", shape (1, 16, 96)
     const inputTensor = new ort.Tensor('float32', flat, [1, 16, 96]);
     const result = await multiSession.run({ 'onnx::Flatten_0': inputTensor });
-    // output name is "39", shape (1,1) — already a probability
     const score = result['39'].data[0];
     const prob = (score >= 0 && score <= 1) ? score : sigmoid(score);
     return prob;
 }
 
 // ----- main detection loop --------------------------------------------
-let embeddingHistory = [];   // rolling buffer of recent embeddings (kept > 16 so we can slide)
-let cycleMaxHistory = [];    // rolling buffer of recent per-cycle max probabilities
-
-const EMBEDDING_HISTORY_MAX = 40; // keep enough history to slide the 16-window across several positions
+let embeddingHistory = [];
+let cycleMaxHistory = [];
+const EMBEDDING_HISTORY_MAX = 40;
 
 async function processAudioChunk() {
     if (isProcessing) return;
@@ -142,7 +148,6 @@ async function processAudioChunk() {
         const startIdx = audioBuffer.length - chunkSize;
         const chunk = new Float32Array(audioBuffer.slice(startIdx));
 
-        // debug: quick RMS level of this chunk — remove once confirmed working
         let sumSq = 0;
         for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
         const rms = Math.sqrt(sumSq / chunk.length);
@@ -165,23 +170,16 @@ async function processAudioChunk() {
         }
         if (!newEmbeddings || newEmbeddings.length === 0) return;
 
-        // append to a longer rolling history so we can slide the 16-window
-        // across multiple positions instead of only checking the very last one
         embeddingHistory.push(...newEmbeddings);
         if (embeddingHistory.length > EMBEDDING_HISTORY_MAX) {
             embeddingHistory = embeddingHistory.slice(-EMBEDDING_HISTORY_MAX);
         }
         if (embeddingHistory.length < CONTEXT_EMBEDDINGS) return;
 
-        // ROLLING MAX: evaluate wake probability at every valid 16-window
-        // position within the current history, not just the last one.
-        // This catches the wake word even if it landed slightly off-center
-        // relative to where the very latest window happens to sit.
         let cycleMaxProb = 0;
         let triggered = false;
         const lastPossibleStart = embeddingHistory.length - CONTEXT_EMBEDDINGS;
-        // only check the newest few positions each cycle to keep cost reasonable
-        const checkFrom = Math.max(0, lastPossibleStart - (newEmbeddings.length));
+        const checkFrom = Math.max(0, lastPossibleStart - newEmbeddings.length);
         for (let start = checkFrom; start <= lastPossibleStart; start++) {
             const context = embeddingHistory.slice(start, start + CONTEXT_EMBEDDINGS);
             let prob;
@@ -194,11 +192,10 @@ async function processAudioChunk() {
             if (prob > cycleMaxProb) cycleMaxProb = prob;
             if (prob >= WAKE_THRESHOLD) {
                 triggered = true;
-                break; // no need to keep checking once we've already crossed threshold
+                break;
             }
         }
 
-        // rolling max across recent cycles too, as a smoothing safety net
         cycleMaxHistory.push(cycleMaxProb);
         if (cycleMaxHistory.length > CYCLE_HISTORY_LEN) {
             cycleMaxHistory = cycleMaxHistory.slice(-CYCLE_HISTORY_LEN);
@@ -208,8 +205,8 @@ async function processAudioChunk() {
         console.log(
             '[ANIQUEN] rms:', rms.toFixed(1),
             ' cycle max prob:', cycleMaxProb.toFixed(3),
-            ' rolling max (last', CYCLE_HISTORY_LEN, 'cycles):', recentRollingMax.toFixed(3)
-        ); // remove once confirmed working
+            ' rolling max:', recentRollingMax.toFixed(3)
+        );
 
         if (triggered || recentRollingMax >= WAKE_THRESHOLD) {
             triggerWake();
@@ -237,28 +234,40 @@ function triggerWake() {
         statusEl.textContent = 'Listening…';
         isWakeActive = false;
         wakeTimeout = null;
-        cycleMaxHistory = []; // reset so old high readings don't cause an instant re-trigger
+        cycleMaxHistory = [];
     }, 2000);
 }
 
 // ----- audio capture ---------------------------------------------------
 function setupAudioProcessing(stream) {
+    // NOTE: we still request SAMPLE_RATE, but we no longer TRUST it —
+    // some mobile browsers silently give us a different native rate.
     audioContext = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
     });
+
+    deviceSampleRate = audioContext.sampleRate;
+    console.log('[ANIQUEN] Requested', SAMPLE_RATE, 'Hz — actual AudioContext rate:', deviceSampleRate);
+    if (deviceSampleRate !== SAMPLE_RATE) {
+        console.warn('[ANIQUEN] Device gave a different sample rate — resampling every chunk to 16kHz.');
+    }
+
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
     processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
+
+        // scale to int16 range first
         const scaled = new Float32Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
             scaled[i] = inputData[i] * 32768;
         }
 
-        // ALWAYS buffer incoming audio, regardless of whether a heavy
-        // inference cycle is currently running.
-        audioBuffer.push(...scaled);
+        // resample to exactly 16000Hz regardless of what the device actually gave us
+        const resampled = resampleTo16k(scaled, deviceSampleRate);
+
+        audioBuffer.push(...resampled);
         if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
             audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
         }
