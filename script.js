@@ -26,7 +26,6 @@ const statusEl = document.getElementById('status');
 const bodyEl = document.body;
 
 let audioContext = null;
-let audioBuffer = [];
 let isWakeActive = false;
 let isProcessing = false;
 let deviceSampleRate = SAMPLE_RATE;
@@ -38,6 +37,41 @@ let multiSession = null;
 function sigmoid(x) {
     return 1 / (1 + Math.exp(-x));
 }
+
+// ----- audio ring buffer -------------------------------------------------
+// Fixed-size typed array instead of a plain JS array with push()/splice().
+// The old approach reallocated and copied on every single audio callback
+// (~4x per second), which is fine on a fast laptop CPU but causes growing
+// GC pressure on weaker mobile CPUs — performance degrades the longer the
+// page stays open. This ring buffer never reallocates.
+class RingBuffer {
+    constructor(size) {
+        this.size = size;
+        this.data = new Float32Array(size);
+        this.writePos = 0;
+        this.filled = 0; // how many samples have been written so far (caps at size)
+    }
+    push(chunk) {
+        for (let i = 0; i < chunk.length; i++) {
+            this.data[this.writePos] = chunk[i];
+            this.writePos = (this.writePos + 1) % this.size;
+        }
+        this.filled = Math.min(this.size, this.filled + chunk.length);
+    }
+    // returns the most recent `count` samples in correct chronological order
+    getLatest(count) {
+        count = Math.min(count, this.filled);
+        const out = new Float32Array(count);
+        let readPos = (this.writePos - count + this.size) % this.size;
+        for (let i = 0; i < count; i++) {
+            out[i] = this.data[readPos];
+            readPos = (readPos + 1) % this.size;
+        }
+        return out;
+    }
+}
+
+const audioRing = new RingBuffer(MAX_BUFFER_SAMPLES);
 
 // ----- resampling (for mobile devices that ignore requested sampleRate) --
 function resampleTo16k(input, inputRate) {
@@ -156,12 +190,9 @@ async function processAudioChunk() {
     isProcessing = true;
 
     try {
-        if (audioBuffer.length < MIN_BUFFER_SAMPLES) return;
+        if (audioRing.filled < MIN_BUFFER_SAMPLES) return;
 
-        const chunkSize = Math.min(audioBuffer.length, MAX_BUFFER_SAMPLES);
-        const startIdx = audioBuffer.length - chunkSize;
-        const rawChunk = new Float32Array(audioBuffer.slice(startIdx));
-
+        const rawChunk = audioRing.getLatest(MAX_BUFFER_SAMPLES);
         const { samples: chunk, rms, gain } = normalizeGain(rawChunk);
 
         let melFrames;
@@ -271,11 +302,7 @@ function setupAudioProcessing(stream) {
         }
 
         const resampled = resampleTo16k(scaled, deviceSampleRate);
-
-        audioBuffer.push(...resampled);
-        if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
-            audioBuffer.splice(0, audioBuffer.length - MAX_BUFFER_SAMPLES);
-        }
+        audioRing.push(resampled);
 
         if (!isWakeActive) {
             processAudioChunk().catch(e => console.warn(e));
@@ -296,10 +323,6 @@ async function init() {
                 sampleRate: SAMPLE_RATE,
                 echoCancellation: false,
                 noiseSuppression: false,
-                // back ON — proven to work correctly in offline testing
-                // (record.html used AGC:true and produced clean, detectable
-                // audio; disabling it made the raw mic signal too harsh/noisy
-                // for our simple manual gain to compensate for)
                 autoGainControl: true,
             }
         });
