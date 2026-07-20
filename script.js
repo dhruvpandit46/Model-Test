@@ -2,11 +2,11 @@
 import * as ort from 'onnxruntime-web';
 
 // ----- configuration -------------------------------------------------
-const SAMPLE_RATE = 16000;       // the rate our MODELS expect
+const SAMPLE_RATE = 16000;
 const FRAMES_PER_WINDOW = 76;
 const MEL_BINS = 32;
-const STRIDE = 8;                // frames
-const CONTEXT_EMBEDDINGS = 16;   // stack 16 embeddings
+const STRIDE = 8;
+const CONTEXT_EMBEDDINGS = 16;
 
 const MAX_BUFFER_SAMPLES = 48000;
 const MIN_BUFFER_SAMPLES = 32000;
@@ -14,23 +14,26 @@ const MIN_BUFFER_SAMPLES = 32000;
 const WAKE_THRESHOLD = 0.3;
 const CYCLE_HISTORY_LEN = 4;
 
-// model files (same folder as HTML)
+// target RMS level we normalize every chunk to, regardless of device/gain
+// quirks. Chosen to roughly match the loudness range where the model was
+// tested successfully (a clearly-spoken word, not whisper-quiet).
+const TARGET_RMS = 600;
+const MIN_RMS_TO_NORMALIZE = 30;  // avoid amplifying near-total silence into pure noise
+const MAX_GAIN = 8;               // cap how much we're willing to boost a quiet signal
+
 const MEL_MODEL_PATH = './melspectrogram.onnx';
 const EMBED_MODEL_PATH = './embedding_model.onnx';
 const MULTI_MODEL_PATH = './hey_Aniquen.onnx';
 
-// ----- DOM refs ------------------------------------------------------
 const statusEl = document.getElementById('status');
 const bodyEl = document.body;
 
-// ----- state ---------------------------------------------------------
 let audioContext = null;
 let audioBuffer = [];
 let isWakeActive = false;
 let isProcessing = false;
-let deviceSampleRate = SAMPLE_RATE;  // will be updated to the ACTUAL rate the browser gives us
+let deviceSampleRate = SAMPLE_RATE;
 
-// ONNX sessions
 let melSession = null;
 let embedSession = null;
 let multiSession = null;
@@ -39,12 +42,7 @@ function sigmoid(x) {
     return 1 / (1 + Math.exp(-x));
 }
 
-// ----- resampling (critical for mobile) -------------------------------
-// Many mobile browsers silently ignore the requested AudioContext
-// sampleRate and give you audio at the device's native hardware rate
-// instead (commonly 44100 or 48000). Our models require exactly 16000Hz.
-// This linearly resamples whatever we actually get down/up to 16000Hz,
-// so the pipeline works correctly regardless of device/browser quirks.
+// ----- resampling (for mobile devices that ignore requested sampleRate) --
 function resampleTo16k(input, inputRate) {
     if (inputRate === SAMPLE_RATE) return input;
     const ratio = inputRate / SAMPLE_RATE;
@@ -58,6 +56,32 @@ function resampleTo16k(input, inputRate) {
         result[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
     }
     return result;
+}
+
+// ----- manual gain normalization ------------------------------------
+// Browser AGC behaves very differently across devices (some mobile
+// devices ramp gain up aggressively even during silence, drowning
+// speech in amplified background noise). This applies our OWN
+// consistent normalization so the model always sees similar loudness,
+// regardless of device quirks.
+function normalizeGain(samples) {
+    let sumSq = 0;
+    for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+    const rms = Math.sqrt(sumSq / samples.length);
+
+    if (rms < MIN_RMS_TO_NORMALIZE) {
+        // essentially silence — don't amplify noise floor
+        return { samples, rms, gain: 1 };
+    }
+
+    let gain = TARGET_RMS / rms;
+    gain = Math.max(0.1, Math.min(MAX_GAIN, gain)); // clamp both directions
+
+    const out = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+        out[i] = samples[i] * gain;
+    }
+    return { samples: out, rms, gain };
 }
 
 // ----- load ONNX models ----------------------------------------------
@@ -75,7 +99,7 @@ async function loadModels() {
     }
 }
 
-// ----- audio processing: mel spectrogram -----------------------------
+// ----- mel spectrogram -------------------------------------------------
 async function computeMelSpectrogram(samples) {
     const inputTensor = new ort.Tensor('float32', samples, [1, samples.length]);
     const results = await melSession.run({ input: inputTensor });
@@ -94,7 +118,7 @@ async function computeMelSpectrogram(samples) {
     return mel2d;
 }
 
-// ----- sliding windows & embedding -----------------------------------
+// ----- embeddings --------------------------------------------------------
 async function computeEmbeddings(melFrames) {
     const embeddings = [];
     const totalFrames = melFrames.length;
@@ -116,7 +140,7 @@ async function computeEmbeddings(melFrames) {
     return embeddings;
 }
 
-// ----- multi model: wake probability ---------------------------------
+// ----- multi model -------------------------------------------------------
 async function computeWakeProbability(embeddingStack) {
     const flat = new Float32Array(16 * 96);
     for (let i = 0; i < 16; i++) {
@@ -128,8 +152,7 @@ async function computeWakeProbability(embeddingStack) {
     const inputTensor = new ort.Tensor('float32', flat, [1, 16, 96]);
     const result = await multiSession.run({ 'onnx::Flatten_0': inputTensor });
     const score = result['39'].data[0];
-    const prob = (score >= 0 && score <= 1) ? score : sigmoid(score);
-    return prob;
+    return (score >= 0 && score <= 1) ? score : sigmoid(score);
 }
 
 // ----- main detection loop --------------------------------------------
@@ -146,11 +169,9 @@ async function processAudioChunk() {
 
         const chunkSize = Math.min(audioBuffer.length, MAX_BUFFER_SAMPLES);
         const startIdx = audioBuffer.length - chunkSize;
-        const chunk = new Float32Array(audioBuffer.slice(startIdx));
+        const rawChunk = new Float32Array(audioBuffer.slice(startIdx));
 
-        let sumSq = 0;
-        for (let i = 0; i < chunk.length; i++) sumSq += chunk[i] * chunk[i];
-        const rms = Math.sqrt(sumSq / chunk.length);
+        const { samples: chunk, rms, gain } = normalizeGain(rawChunk);
 
         let melFrames;
         try {
@@ -203,7 +224,8 @@ async function processAudioChunk() {
         const recentRollingMax = Math.max(...cycleMaxHistory);
 
         console.log(
-            '[ANIQUEN] rms:', rms.toFixed(1),
+            '[ANIQUEN] raw rms:', rms.toFixed(1),
+            ' gain applied:', gain.toFixed(2),
             ' cycle max prob:', cycleMaxProb.toFixed(3),
             ' rolling max:', recentRollingMax.toFixed(3)
         );
@@ -216,7 +238,7 @@ async function processAudioChunk() {
     }
 }
 
-// ----- UI trigger (green flash) --------------------------------------
+// ----- UI trigger --------------------------------------------------------
 let wakeTimeout = null;
 
 function triggerWake() {
@@ -240,31 +262,23 @@ function triggerWake() {
 
 // ----- audio capture ---------------------------------------------------
 function setupAudioProcessing(stream) {
-    // NOTE: we still request SAMPLE_RATE, but we no longer TRUST it —
-    // some mobile browsers silently give us a different native rate.
     audioContext = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
     });
 
     deviceSampleRate = audioContext.sampleRate;
     console.log('[ANIQUEN] Requested', SAMPLE_RATE, 'Hz — actual AudioContext rate:', deviceSampleRate);
-    if (deviceSampleRate !== SAMPLE_RATE) {
-        console.warn('[ANIQUEN] Device gave a different sample rate — resampling every chunk to 16kHz.');
-    }
 
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
     processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
-
-        // scale to int16 range first
         const scaled = new Float32Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
             scaled[i] = inputData[i] * 32768;
         }
 
-        // resample to exactly 16000Hz regardless of what the device actually gave us
         const resampled = resampleTo16k(scaled, deviceSampleRate);
 
         audioBuffer.push(...resampled);
@@ -291,7 +305,9 @@ async function init() {
                 sampleRate: SAMPLE_RATE,
                 echoCancellation: false,
                 noiseSuppression: false,
-                autoGainControl: true,
+                // turned OFF — browser AGC was behaving erratically on mobile;
+                // we now do our own normalization in normalizeGain() instead.
+                autoGainControl: false,
             }
         });
         setupAudioProcessing(stream);
