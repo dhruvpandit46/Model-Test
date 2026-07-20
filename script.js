@@ -14,12 +14,9 @@ const MIN_BUFFER_SAMPLES = 32000;
 const WAKE_THRESHOLD = 0.3;
 const CYCLE_HISTORY_LEN = 4;
 
-// target RMS level we normalize every chunk to, regardless of device/gain
-// quirks. Chosen to roughly match the loudness range where the model was
-// tested successfully (a clearly-spoken word, not whisper-quiet).
 const TARGET_RMS = 600;
-const MIN_RMS_TO_NORMALIZE = 30;  // avoid amplifying near-total silence into pure noise
-const MAX_GAIN = 8;               // cap how much we're willing to boost a quiet signal
+const MIN_RMS_TO_NORMALIZE = 30;
+const MAX_GAIN = 8;
 
 const MEL_MODEL_PATH = './melspectrogram.onnx';
 const EMBED_MODEL_PATH = './embedding_model.onnx';
@@ -58,24 +55,18 @@ function resampleTo16k(input, inputRate) {
     return result;
 }
 
-// ----- manual gain normalization ------------------------------------
-// Browser AGC behaves very differently across devices (some mobile
-// devices ramp gain up aggressively even during silence, drowning
-// speech in amplified background noise). This applies our OWN
-// consistent normalization so the model always sees similar loudness,
-// regardless of device quirks.
+// ----- manual gain normalization (used ON TOP of browser AGC) ----------
 function normalizeGain(samples) {
     let sumSq = 0;
     for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
     const rms = Math.sqrt(sumSq / samples.length);
 
     if (rms < MIN_RMS_TO_NORMALIZE) {
-        // essentially silence — don't amplify noise floor
         return { samples, rms, gain: 1 };
     }
 
     let gain = TARGET_RMS / rms;
-    gain = Math.max(0.1, Math.min(MAX_GAIN, gain)); // clamp both directions
+    gain = Math.max(0.1, Math.min(MAX_GAIN, gain));
 
     const out = new Float32Array(samples.length);
     for (let i = 0; i < samples.length; i++) {
@@ -305,9 +296,11 @@ async function init() {
                 sampleRate: SAMPLE_RATE,
                 echoCancellation: false,
                 noiseSuppression: false,
-                // turned OFF — browser AGC was behaving erratically on mobile;
-                // we now do our own normalization in normalizeGain() instead.
-                autoGainControl: false,
+                // back ON — proven to work correctly in offline testing
+                // (record.html used AGC:true and produced clean, detectable
+                // audio; disabling it made the raw mic signal too harsh/noisy
+                // for our simple manual gain to compensate for)
+                autoGainControl: true,
             }
         });
         setupAudioProcessing(stream);
