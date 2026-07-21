@@ -12,10 +12,8 @@
         <p id="status">Listening…</p>
     </div>
 
-    <!-- Enables cross-origin isolation (COOP/COEP) even on static hosting like
-         GitHub Pages, which lets onnxruntime-web use multi-threaded WASM
-         instead of a single CPU thread. Must load before everything else. -->
-    <script src="./coi-serviceworker.js"></script>
+    <!-- coi-serviceworker removed for now — multi-threading needs onnxruntime-web
+         self-hosted (same-origin) to work; using CDN + single-thread WASM instead -->
 
     <script type="importmap">
         {
