@@ -187,6 +187,28 @@ async function computeWakeProbability(embeddingStack) {
     return (score >= 0 && score <= 1) ? score : sigmoid(score);
 }
 
+// ----- voice activity detection (VAD) gating ---------------------------
+// Running the full mel+embedding+wake pipeline continuously, even during
+// silence, keeps the mobile CPU under sustained heavy load — this is very
+// likely causing thermal throttling, which is why detection works for the
+// first few seconds and then degrades. This lightweight energy-based gate
+// only runs the heavy pipeline when something is actually happening
+// acoustically, letting the CPU (and its temperature) recover in between.
+let noiseFloor = 200;           // adaptive estimate of "silence" RMS level
+const NOISE_FLOOR_ALPHA = 0.05; // how fast the floor adapts (slow = stable)
+const VAD_MULTIPLIER = 2.0;     // how far above the floor counts as "active"
+const ACTIVE_HOLD_CYCLES = 6;   // once triggered, keep processing for ~N cycles
+                                 // so a full word isn't cut off mid-utterance
+let activeCyclesRemaining = 0;
+
+function quickRms(samples, count) {
+    const n = Math.min(count, samples.length);
+    const start = samples.length - n;
+    let sumSq = 0;
+    for (let i = start; i < samples.length; i++) sumSq += samples[i] * samples[i];
+    return Math.sqrt(sumSq / n);
+}
+
 // ----- main detection loop --------------------------------------------
 let embeddingHistory = [];
 let cycleMaxHistory = [];
@@ -198,6 +220,25 @@ async function processAudioChunk() {
 
     try {
         if (audioRing.filled < MIN_BUFFER_SAMPLES) return;
+
+        // cheap VAD check first — only look at the most recent ~256ms
+        const recentChunk = audioRing.getLatest(4096);
+        const recentRms = quickRms(recentChunk, recentChunk.length);
+
+        const isActive = recentRms > noiseFloor * VAD_MULTIPLIER;
+        if (isActive) {
+            activeCyclesRemaining = ACTIVE_HOLD_CYCLES;
+        } else {
+            // slowly adapt the noise floor toward quiet periods only
+            noiseFloor = noiseFloor * (1 - NOISE_FLOOR_ALPHA) + recentRms * NOISE_FLOOR_ALPHA;
+        }
+
+        if (activeCyclesRemaining <= 0) {
+            // nothing interesting happening — skip the expensive part entirely
+            console.log('[ANIQUEN] idle (rms:', recentRms.toFixed(1), ' floor:', noiseFloor.toFixed(1), ')');
+            return;
+        }
+        activeCyclesRemaining--;
 
         const rawChunk = audioRing.getLatest(MAX_BUFFER_SAMPLES);
         const { samples: chunk, rms, gain } = normalizeGain(rawChunk);
