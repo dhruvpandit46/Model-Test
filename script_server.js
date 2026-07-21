@@ -5,7 +5,7 @@ const SAMPLE_RATE = 16000;
 
 // CHANGE THIS to your server's address once deployed, e.g.:
 // const SERVER_URL = 'wss://your-vm-domain-or-ip:8000/ws';
-const SERVER_URL = 'wss://aniquen-wakeword.onrender.com/ws';
+const SERVER_URL = 'wss://34-55-6-30.sslip.io/ws';
 
 const statusEl = document.getElementById('status');
 const bodyEl = document.body;
